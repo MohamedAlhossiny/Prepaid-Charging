@@ -4,11 +4,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
+import java.security.KeyPair;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.*;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
 import javax.sound.sampled.*;
 
 public class MSC {
@@ -32,6 +35,11 @@ public class MSC {
     private Map<String, Socket> clientSockets;
     private ScheduledExecutorService scheduler;
     private volatile boolean running = true;
+    
+    // Encryption related fields
+    private KeyPair rsaKeyPair;
+    private Map<String, SecretKey> clientKeys; // Store AES keys for each client
+    private Map<String, byte[]> clientIVs;    // Store IVs for each client
     
     // Class to track call details
     private static class UserCall {
@@ -64,6 +72,8 @@ public class MSC {
         activeCalls = new ConcurrentHashMap<>();
         userBalances = new HashMap<>();
         clientSockets = new ConcurrentHashMap<>();
+        clientKeys = new ConcurrentHashMap<>();
+        clientIVs = new ConcurrentHashMap<>();
         scheduler = Executors.newScheduledThreadPool(2);
         
         // Initialize some user balances (in a real system, would be loaded from a database)
@@ -72,10 +82,18 @@ public class MSC {
         userBalances.put("01112223333", 25.0);
         userBalances.put("01020053936", 5.0);
         
-        
         // Create required directories if they don't exist
         createDirectoryIfNotExists(VOICE_DIR);
         createDirectoryIfNotExists(CDR_DIR);
+        
+        // Initialize the RSA key pair for secure key exchange
+        try {
+            rsaKeyPair = SecurityUtils.generateRSAKeyPair();
+            System.out.println("Generated RSA key pair for secure communications");
+        } catch (Exception e) {
+            System.err.println("Error generating RSA key pair: " + e.getMessage());
+            e.printStackTrace();
+        }
     }
     
     private void createDirectoryIfNotExists(String dirPath) {
@@ -146,22 +164,142 @@ public class MSC {
     }
     
     private void processSignalingClient(Socket clientSocket) {
+        String clientAddress = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+        String connectedMsisdn = null;
+        
         try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+            InputStream is = clientSocket.getInputStream();
+            OutputStream os = clientSocket.getOutputStream();
+            BufferedReader in = new BufferedReader(new InputStreamReader(is));
+            PrintWriter out = new PrintWriter(os, true);
+            
+            // Send the server's public key to enable secure key exchange
+            String publicKeyStr = SecurityUtils.keyToString(rsaKeyPair.getPublic());
+            out.println("PUBLIC_KEY:" + publicKeyStr);
+            System.out.println("Sent public key to client for secure key exchange");
+            
             String message;
             
+            // Wait for the client to send its encrypted AES key
             while ((message = in.readLine()) != null) {
-                if (message.startsWith("START_CALL:")) {
-                    String msisdn = message.substring("START_CALL:".length());
-                    storeClientSocket(msisdn, clientSocket);
-                    handleStartCall(msisdn, clientSocket.getInetAddress());
-                } else if (message.startsWith("END_CALL:")) {
-                    String msisdn = message.substring("END_CALL:".length());
-                    handleEndCall(msisdn);
+                if (message.startsWith("AES_KEY:")) {
+                    // Client is sending the AES key encrypted with our public key
+                    String encryptedKeyStr = message.substring("AES_KEY:".length());
+                    byte[] encryptedKey = Base64.getDecoder().decode(encryptedKeyStr);
+                    
+                    // Process the next line which should be the IV
+                    String ivLine = in.readLine();
+                    if (ivLine != null && ivLine.startsWith("IV:")) {
+                        String ivStr = ivLine.substring("IV:".length());
+                        byte[] iv = Base64.getDecoder().decode(ivStr);
+                        
+                        // Decrypt the AES key using our private key
+                        byte[] decryptedKeyBytes = SecurityUtils.decryptRSA(encryptedKey, rsaKeyPair.getPrivate());
+                        SecretKey clientKey = new SecretKeySpec(decryptedKeyBytes, 0, decryptedKeyBytes.length, "AES");
+                        
+                        // Temporarily store the key - will associate with MSISDN once we receive it
+                        String tempKeyId = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+                        clientKeys.put(tempKeyId, clientKey);
+                        clientIVs.put(tempKeyId, iv);
+                        
+                        System.out.println("Received and decrypted AES key and IV from client");
+                        
+                        // Now ready to receive encrypted messages
+                        out.println("READY_FOR_ENCRYPTED");
+                    }
+                } 
+                else if (message.startsWith("ENC:")) {
+                    // This is an encrypted message
+                    String encryptedStr = message.substring("ENC:".length());
+                    
+                    // Get the key/IV for this client
+                    String tempKeyId = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+                    SecretKey clientKey = clientKeys.get(tempKeyId);
+                    byte[] iv = clientIVs.get(tempKeyId);
+                    
+                    if (clientKey != null && iv != null) {
+                        // Decrypt the message
+                        String decryptedMsg = SecurityUtils.decryptStringAES(encryptedStr, clientKey, iv);
+                        
+                        // Process the decrypted message
+                        if (decryptedMsg.startsWith("START_CALL:")) {
+                            connectedMsisdn = decryptedMsg.substring("START_CALL:".length());
+                            
+                            // Now associate the key with the MSISDN
+                            clientKeys.put(connectedMsisdn, clientKey);
+                            clientIVs.put(connectedMsisdn, iv);
+                            
+                            // Remove the temporary key mapping
+                            clientKeys.remove(tempKeyId);
+                            clientIVs.remove(tempKeyId);
+                            
+                            storeClientSocket(connectedMsisdn, clientSocket);
+                            handleStartCall(connectedMsisdn, clientSocket.getInetAddress());
+                        } 
+                        else if (decryptedMsg.startsWith("END_CALL:")) {
+                            connectedMsisdn = decryptedMsg.substring("END_CALL:".length());
+                            handleEndCall(connectedMsisdn);
+                        }
+                    } else {
+                        System.err.println("Error: No encryption key available for client");
+                    }
+                }
+                // Support for legacy unencrypted communication - can be removed later
+                else if (message.startsWith("START_CALL:") || message.startsWith("END_CALL:")) {
+                    System.out.println("WARNING: Received unencrypted message: " + message);
+                    if (message.startsWith("START_CALL:")) {
+                        connectedMsisdn = message.substring("START_CALL:".length());
+                        storeClientSocket(connectedMsisdn, clientSocket);
+                        handleStartCall(connectedMsisdn, clientSocket.getInetAddress());
+                    } else if (message.startsWith("END_CALL:")) {
+                        connectedMsisdn = message.substring("END_CALL:".length());
+                        handleEndCall(connectedMsisdn);
+                    }
                 }
             }
-        } catch (IOException e) {
-            System.err.println("Error processing signaling client: " + e.getMessage());
+            
+            // If we reach here, the client closed the connection normally
+            System.out.println("Client " + clientAddress + " disconnected normally");
+            
+        } catch (SocketException e) {
+            // Handle connection reset errors more gracefully
+            System.out.println("Client " + clientAddress + " connection lost: " + e.getMessage());
+            
+            // If we know which MSISDN was connected, end the call properly
+            if (connectedMsisdn != null) {
+                UserCall call = activeCalls.get(connectedMsisdn);
+                if (call != null && call.active) {
+                    System.out.println("Ending call for MSISDN " + connectedMsisdn + " due to connection loss");
+                    handleEndCall(connectedMsisdn);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Error processing signaling client from " + clientAddress + ": " + e.getMessage());
+            
+            // If we know which MSISDN was connected, end the call properly
+            if (connectedMsisdn != null) {
+                UserCall call = activeCalls.get(connectedMsisdn);
+                if (call != null && call.active) {
+                    System.out.println("Ending call for MSISDN " + connectedMsisdn + " due to error");
+                    handleEndCall(connectedMsisdn);
+                }
+            }
+        } finally {
+            try {
+                // Clean up temporary keys if they exist
+                String tempKeyId = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+                clientKeys.remove(tempKeyId);
+                clientIVs.remove(tempKeyId);
+                
+                // Close the socket if it's still open
+                if (!clientSocket.isClosed()) {
+                    clientSocket.close();
+                }
+                
+                System.out.println("Client socket cleanup completed for " + clientAddress);
+            } catch (IOException e) {
+                System.err.println("Error closing client socket: " + e.getMessage());
+            }
         }
     }
     
@@ -435,13 +573,27 @@ public class MSC {
             if (socket != null && !socket.isClosed()) {
                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
                 String terminationMessage = "TERMINATE_CALL:" + reason;
-                out.println(terminationMessage);
-                System.out.println("Sent termination message to mobile " + msisdn + ": " + terminationMessage);
+                
+                // Encrypt the message if we have a key for this client
+                SecretKey clientKey = clientKeys.get(msisdn);
+                byte[] iv = clientIVs.get(msisdn);
+                
+                if (clientKey != null && iv != null) {
+                    // Encrypt and send
+                    String encryptedMsg = SecurityUtils.encryptStringAES(terminationMessage, clientKey, iv);
+                    out.println("ENC:" + encryptedMsg);
+                    System.out.println("Sent encrypted termination message to mobile " + msisdn + ": " + terminationMessage);
+                } else {
+                    // Fallback to unencrypted
+                    out.println(terminationMessage);
+                    System.out.println("WARNING: Sent unencrypted termination message to mobile " + msisdn + ": " + terminationMessage);
+                }
             } else {
                 System.out.println("No active socket found for MSISDN " + msisdn + " to send termination message");
             }
         } catch (Exception e) {
             System.err.println("Error sending termination message: " + e.getMessage());
+            e.printStackTrace();
         }
     }
     
@@ -465,7 +617,7 @@ public class MSC {
             
             System.out.println("Audio playback started");
             
-            byte[] buffer = new byte[BUFFER_SIZE];
+            byte[] buffer = new byte[BUFFER_SIZE * 2]; // Increase buffer size for encrypted data
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             
             System.out.println("Voice data handler ready - waiting for packets on UDP port " + UDP_PORT);
@@ -530,24 +682,71 @@ public class MSC {
                 
                 // Only play audio if from active call
                 if (isActiveCall && activeCall != null) {
-                    // If we're getting audio data, play it through the speakers
+                    // If we're getting audio data, decrypt and play it
                     if (packet.getLength() > 0) {
-                        // Store a copy of the audio data for recording
-                        byte[] audioCopy = Arrays.copyOf(packet.getData(), packet.getLength());
-                        activeCall.audioData.write(audioCopy, 0, audioCopy.length);
+                        byte[] audioData = packet.getData();
+                        int audioLength = packet.getLength();
                         
-                        // Play the audio
-                        line.write(packet.getData(), 0, packet.getLength());
-                        playedPacketCount++;
+                        // Get the encryption key for this MSISDN
+                        SecretKey clientKey = clientKeys.get(activeMsisdn);
+                        byte[] iv = clientIVs.get(activeMsisdn);
                         
-                        if (playedPacketCount == 1) {
-                            System.out.println("Started playing audio from first packet");
-                        }
-                        
-                        if (playedPacketCount % 50 == 0) {
-                            System.out.println("Playing audio from MSISDN: " + activeMsisdn + 
-                                              " at " + sourceAddress + ":" + sourcePort +
-                                              " (packet size: " + packet.getLength() + " bytes)");
+                        if (clientKey != null && iv != null) {
+                            try {
+                                // Decrypt the audio data using the specialized audio decryption method
+                                byte[] decryptedData = SecurityUtils.decryptAudioAES(
+                                    Arrays.copyOf(audioData, audioLength), clientKey, iv, 0);
+                                
+                                // Store a copy of the decrypted audio data for recording
+                                activeCall.audioData.write(decryptedData, 0, decryptedData.length);
+                                
+                                // Play the decrypted audio
+                                line.write(decryptedData, 0, decryptedData.length);
+                                playedPacketCount++;
+                                
+                                if (playedPacketCount == 1) {
+                                    System.out.println("Started playing audio from first packet (decrypted)");
+                                }
+                                
+                                if (playedPacketCount % 50 == 0) {
+                                    System.out.println("Playing decrypted audio from MSISDN: " + activeMsisdn + 
+                                                    " at " + sourceAddress + ":" + sourcePort +
+                                                    " (packet size: " + audioLength + " bytes, decrypted size: " 
+                                                    + decryptedData.length + " bytes)");
+                                }
+                            } catch (Exception e) {
+                                System.err.println("Error decrypting audio data: " + e.getMessage());
+                                
+                                // Try to determine if this is an unencrypted legacy packet
+                                boolean looksLikeUnencryptedAudio = false;
+                                
+                                // Audio data typically has alternating positive and negative values
+                                // Check a small sample of the data to see if it looks like audio
+                                if (audioLength > 10) {
+                                    int nonZeroCount = 0;
+                                    for (int i = 0; i < Math.min(20, audioLength); i++) {
+                                        if (audioData[i] != 0) nonZeroCount++;
+                                    }
+                                    // If we have some non-zero bytes, it might be unencrypted audio
+                                    looksLikeUnencryptedAudio = (nonZeroCount > 5);
+                                }
+                                
+                                if (looksLikeUnencryptedAudio) {
+                                    System.out.println("Packet appears to be unencrypted audio, playing in legacy mode");
+                                    activeCall.audioData.write(audioData, 0, audioLength);
+                                    line.write(audioData, 0, audioLength);
+                                    playedPacketCount++;
+                                } else {
+                                    System.err.println("Audio packet cannot be decrypted or played, skipping");
+                                }
+                            }
+                        } else {
+                            // No encryption key, play as-is (for backward compatibility)
+                            System.out.println("No encryption key for MSISDN " + activeMsisdn + 
+                                            ", playing unencrypted audio");
+                            activeCall.audioData.write(audioData, 0, audioLength);
+                            line.write(audioData, 0, audioLength);
+                            playedPacketCount++;
                         }
                     }
                 } else {

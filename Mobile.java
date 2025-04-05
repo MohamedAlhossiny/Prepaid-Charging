@@ -1,7 +1,11 @@
 import java.io.*;
 import java.net.*;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import java.util.concurrent.*;
+import javax.crypto.SecretKey;
 import javax.sound.sampled.*;
 
 public class Mobile {
@@ -23,6 +27,12 @@ public class Mobile {
     private volatile boolean running = true;
     private int packetsSent = 0;
     private int selectedMicIndex = -1; // -1 means use default mic
+    
+    // Encryption related fields
+    private PublicKey mscPublicKey; // Server's public key for initial secure exchange
+    private SecretKey aesKey;       // AES key for symmetric encryption
+    private byte[] iv;              // Initialization vector for AES
+    private boolean encryptionEnabled = false;
     
     public Mobile(String msisdn) {
         this.msisdn = msisdn;
@@ -61,10 +71,64 @@ public class Mobile {
             
             // Connect to MSC for signaling
             signalingSocket = new Socket(MSC_HOST, SIGNALING_PORT);
+            BufferedReader in = new BufferedReader(new InputStreamReader(signalingSocket.getInputStream()));
             PrintWriter out = new PrintWriter(signalingSocket.getOutputStream(), true);
             
-            // Send start call signaling
-            out.println("START_CALL:" + msisdn);
+            // First, wait for the server to send its public key
+            String message = in.readLine();
+            if (message != null && message.startsWith("PUBLIC_KEY:")) {
+                String publicKeyStr = message.substring("PUBLIC_KEY:".length());
+                
+                try {
+                    // Convert the Base64-encoded string back to a PublicKey
+                    byte[] publicKeyBytes = Base64.getDecoder().decode(publicKeyStr);
+                    mscPublicKey = KeyFactory.getInstance("RSA").generatePublic(
+                            new X509EncodedKeySpec(publicKeyBytes));
+                    
+                    // Generate AES key and IV for symmetric encryption
+                    aesKey = SecurityUtils.generateAESKey();
+                    iv = SecurityUtils.generateIV();
+                    
+                    // Encrypt the AES key with the server's public key
+                    byte[] encryptedKey = SecurityUtils.encryptRSA(aesKey.getEncoded(), mscPublicKey);
+                    String encryptedKeyStr = Base64.getEncoder().encodeToString(encryptedKey);
+                    
+                    // Send the encrypted AES key to the server
+                    out.println("AES_KEY:" + encryptedKeyStr);
+                    
+                    // Send the IV (not encrypted, as it's not sensitive)
+                    String ivStr = Base64.getEncoder().encodeToString(iv);
+                    out.println("IV:" + ivStr);
+                    
+                    // Wait for server to confirm it's ready for encrypted messages
+                    message = in.readLine();
+                    if (message != null && message.equals("READY_FOR_ENCRYPTED")) {
+                        encryptionEnabled = true;
+                        System.out.println("Secure communication established with MSC");
+                        
+                        // Send encrypted start call signaling
+                        String startCallMsg = "START_CALL:" + msisdn;
+                        String encryptedMsg = SecurityUtils.encryptStringAES(startCallMsg, aesKey, iv);
+                        out.println("ENC:" + encryptedMsg);
+                        System.out.println("Sent encrypted start call signaling to MSC");
+                    } else {
+                        System.out.println("Warning: Server did not confirm encryption readiness");
+                        // Fall back to unencrypted mode
+                        out.println("START_CALL:" + msisdn);
+                        System.out.println("Sent unencrypted start call signaling to MSC (encryption failed)");
+                    }
+                } catch (Exception e) {
+                    System.err.println("Error setting up encryption: " + e.getMessage());
+                    // Fall back to unencrypted mode
+                    out.println("START_CALL:" + msisdn);
+                    System.out.println("Sent unencrypted start call signaling to MSC (encryption failed)");
+                }
+            } else {
+                // Server doesn't support encryption, use unencrypted mode
+                out.println("START_CALL:" + msisdn);
+                System.out.println("Sent unencrypted start call signaling to MSC (no encryption support)");
+            }
+            
             System.out.println("Sent start call signaling to MSC at " + MSC_HOST + ":" + SIGNALING_PORT);
             
             // Setup reader to receive responses from MSC
@@ -98,34 +162,8 @@ public class Mobile {
                         // Ignore
                     }
                     
-                    if (signalingSocket != null && !signalingSocket.isClosed()) {
-                        try {
-                            PrintWriter shutdownOut = new PrintWriter(signalingSocket.getOutputStream(), true);
-                            shutdownOut.println("END_CALL:" + msisdn);
-                            shutdownOut.close();
-                        } catch (IOException e) {
-                            // Ignore, we're shutting down
-                        } finally {
-                            try {
-                                signalingSocket.close();
-                            } catch (IOException e) {
-                                // Ignore
-                            }
-                        }
-                    }
-                    
-                    if (scheduler != null) {
-                        scheduler.shutdownNow();
-                    }
-                    
-                    if (line != null && line.isOpen()) {
-                        line.stop();
-                        line.close();
-                    }
-                    
-                    if (socket != null && !socket.isClosed()) {
-                        socket.close();
-                    }
+                    // Call our cleanup method instead of duplicating code
+                    cleanup(line);
                     
                     System.out.println("Cleanup complete");
                 } catch (Exception e) {
@@ -163,9 +201,37 @@ public class Mobile {
                 String message;
                 
                 while (running && (message = in.readLine()) != null) {
-                    System.out.println("Received from MSC: " + message);
+                    System.out.println("Received from MSC: " + (message.startsWith("ENC:") ? "[Encrypted Message]" : message));
                     
-                    if (message.startsWith("TERMINATE_CALL:")) {
+                    // Check if this is an encrypted message
+                    if (encryptionEnabled && message.startsWith("ENC:")) {
+                        try {
+                            // Decrypt the message
+                            String encryptedPart = message.substring("ENC:".length());
+                            String decryptedMessage = SecurityUtils.decryptStringAES(encryptedPart, aesKey, iv);
+                            System.out.println("Decrypted message: " + decryptedMessage);
+                            
+                            // Process the decrypted message
+                            if (decryptedMessage.startsWith("TERMINATE_CALL:")) {
+                                String reason = "Unknown reason";
+                                if (decryptedMessage.contains(":")) {
+                                    reason = decryptedMessage.substring(decryptedMessage.indexOf(":") + 1);
+                                }
+                                System.out.println("\n*** CALL TERMINATED BY MSC: " + reason + " ***");
+                                System.out.println("The call has been terminated by the Mobile Switching Center");
+                                running = false;
+                                
+                                // Exit the application after a brief pause
+                                scheduler.schedule(() -> {
+                                    System.exit(0);
+                                }, 2, TimeUnit.SECONDS);
+                            }
+                        } catch (Exception e) {
+                            System.err.println("Error decrypting message: " + e.getMessage());
+                        }
+                    }
+                    // Also support unencrypted messages for backward compatibility
+                    else if (message.startsWith("TERMINATE_CALL:")) {
                         String reason = "Unknown reason";
                         if (message.contains(":")) {
                             reason = message.substring(message.indexOf(":") + 1);
@@ -286,7 +352,25 @@ public class Mobile {
             byte[] chunk = new byte[chunkSize];
             System.arraycopy(audioData, offset, chunk, 0, chunkSize);
             
-            DatagramPacket packet = new DatagramPacket(chunk, chunkSize, address, PORT);
+            // If encryption is enabled, encrypt the chunk before sending
+            byte[] dataToSend = chunk;
+            if (encryptionEnabled && aesKey != null && iv != null) {
+                try {
+                    // Encrypt the audio data using the specialized audio encryption method
+                    dataToSend = SecurityUtils.encryptAudioAES(chunk, aesKey, iv);
+                    
+                    if (packetsSent == 0 || packetsSent % 1000 == 0) {
+                        System.out.println("Sending encrypted audio packet (original size: " + 
+                                        chunk.length + ", encrypted size: " + dataToSend.length + ")");
+                    }
+                } catch (Exception e) {
+                    System.err.println("Error encrypting audio data: " + e.getMessage());
+                    // Fall back to unencrypted data if encryption fails
+                    dataToSend = chunk;
+                }
+            }
+            
+            DatagramPacket packet = new DatagramPacket(dataToSend, dataToSend.length, address, PORT);
             if (!socket.isClosed()) {
                 socket.send(packet);
                 packetsSent++;
@@ -368,14 +452,33 @@ public class Mobile {
                     }
                     
                     if (hasAudio || packetsSent % 50 == 0) {
+                        // If encryption is enabled, encrypt the audio data before sending
+                        byte[] dataToSend = Arrays.copyOf(buffer, count);
+                        if (encryptionEnabled && aesKey != null && iv != null) {
+                            try {
+                                // Encrypt the audio data using the specialized audio encryption method
+                                dataToSend = SecurityUtils.encryptAudioAES(dataToSend, aesKey, iv);
+                                
+                                if (packetsSent == 0 || packetsSent % 500 == 0) {
+                                    System.out.println("Sending encrypted microphone audio (original size: " + 
+                                                    count + ", encrypted size: " + dataToSend.length + ")");
+                                }
+                            } catch (Exception e) {
+                                System.err.println("Error encrypting microphone data: " + e.getMessage());
+                                // Fall back to unencrypted data if encryption fails
+                                dataToSend = Arrays.copyOf(buffer, count);
+                            }
+                        }
+                        
                         // Send via UDP
-                        DatagramPacket packet = new DatagramPacket(buffer, count, address, PORT);
+                        DatagramPacket packet = new DatagramPacket(dataToSend, dataToSend.length, address, PORT);
                         if (!socket.isClosed()) {
                             socket.send(packet);
                             packetsSent++;
                             
                             if (packetsSent % 50 == 0) {
-                                System.out.println("Sent " + packetsSent + " audio packets (size: " + count + " bytes)");
+                                System.out.println("Sent " + packetsSent + " audio packets (size: " + 
+                                                (encryptionEnabled ? "original: " + count + ", encrypted: " + dataToSend.length : count) + " bytes)");
                             }
                         }
                     }
@@ -405,10 +508,28 @@ public class Mobile {
                 if (signalingSocket != null && !signalingSocket.isClosed()) {
                     try {
                         PrintWriter shutdownOut = new PrintWriter(signalingSocket.getOutputStream(), true);
-                        shutdownOut.println("END_CALL:" + msisdn);
+                        
+                        // If encryption is enabled, send encrypted END_CALL message
+                        if (encryptionEnabled && aesKey != null && iv != null) {
+                            try {
+                                String endCallMsg = "END_CALL:" + msisdn;
+                                String encryptedMsg = SecurityUtils.encryptStringAES(endCallMsg, aesKey, iv);
+                                shutdownOut.println("ENC:" + encryptedMsg);
+                                System.out.println("Sent encrypted end call signaling to MSC");
+                            } catch (Exception e) {
+                                // Fall back to unencrypted mode if encryption fails
+                                shutdownOut.println("END_CALL:" + msisdn);
+                                System.out.println("Sent unencrypted end call signaling (encryption failed)");
+                            }
+                        } else {
+                            // Unencrypted mode
+                            shutdownOut.println("END_CALL:" + msisdn);
+                            System.out.println("Sent unencrypted end call signaling to MSC");
+                        }
+                        
                         shutdownOut.close();
                     } catch (IOException e) {
-                        // Ignore
+                        // Ignore, we're shutting down
                     } finally {
                         try {
                             signalingSocket.close();
