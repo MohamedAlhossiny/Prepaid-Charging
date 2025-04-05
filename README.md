@@ -2,7 +2,7 @@
 
 This project implements a voice call system with real-time prepaid charging. It consists of two Java applications:
 
-1. **Mobile Phone Application**: Captures voice from the microphone and sends it via UDP to the MSC.
+1. **Mobile Phone Application**: Captures voice from the microphone and encrypt it with AES algorithm, then sends it via UDP to the MSC.
 2. **Mobile Switching Center (MSC) Application**: Receives voice data via UDP, plays it on the PC speaker, and handles call charging.
 
 ## Requirements
@@ -229,6 +229,7 @@ Example for terminated call due to depleted balance:
 - The Mobile application automatically sends an end call signal when the application is shut down.
 - The MSC sends termination messages to the Mobile when a call is rejected or terminated due to insufficient balance.
 - Audio is sampled at 44100Hz, 16-bit, mono.
+- AES key is exchanged by RSA public/private keys.
 - Both applications include extensive debug output to help diagnose issues.
 
 ## Troubleshooting
